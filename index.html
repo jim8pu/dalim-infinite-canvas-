@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dalim | Infinite Canvas</title>
+    <link rel="icon" type="image/svg+xml" href="images/new.svg">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div class="main-container">
+        <main class="main-content">
+            <div id="canvas-view" class="view">
+                <canvas id="canvas"></canvas>
+                
+                <div class="canvas-top-bar">
+                    <div id="top-center-controls" class="top-bar-group">
+                        <button id="back-to-revisions-btn" class="control-button" title="Back to Revisions"><i data-feather="arrow-left"></i></button>
+                        <div class="toolbox-separator"></div>
+                        <button id="pan-tool-btn" class="control-button" title="Pan Tool"><i data-feather="move"></i></button>
+                        <div class="toolbox-separator"></div>
+                        <button class="control-button zoom-btn" data-zoom="out" title="Zoom Out"><i data-feather="zoom-out"></i></button>
+                        <div id="zoom-level-display" class="control-button">100%</div>
+                        <button class="control-button zoom-btn" data-zoom="in" title="Zoom In"><i data-feather="zoom-in"></i></button>
+                        <div class="toolbox-separator"></div>
+                        <button id="layers-btn" class="control-button" title="Layers"><i data-feather="layers"></i></button>
+                        <!-- MODIFIED: Removed settings button -->
+                        <button id="settings-btn" class="control-button" title="Settings"><i data-feather="more-horizontal"></i></button>
+                    </div>
+                </div>
+
+                <!-- MODIFIED: This popup is now positioned by CSS near the radial menu -->
+                <div id="settings-popup" class="floating-panel">
+                    <div class="setting-row" id="pen-size-setting">
+                        <label for="pen-size-slider">Size</label>
+                        <input type="range" id="pen-size-slider" min="1" max="100" value="5">
+                        <span id="pen-size-value" class="value-display">5</span>
+                    </div>
+                    <div class="setting-row" id="opacity-setting">
+                        <label for="opacity-slider">Opacity</label>
+                        <input type="range" id="opacity-slider" min="1" max="100" step="1" value="100">
+                        <span id="opacity-value" class="value-display">100</span>
+                    </div>
+                    <div class="setting-row" id="smoothness-setting">
+                        <label for="smoothness-slider">Smoothness</label>
+                        <input type="range" id="smoothness-slider" min="1" max="100" step="1" value="50">
+                        <span id="smoothness-value" class="value-display">50</span>
+                    </div>
+                </div>
+
+                <div id="layers-panel" class="floating-panel">
+                    <div class="layers-header">
+                        <h3>Layers</h3>
+                        <button id="add-layer-btn" class="control-button" title="Add New Layer"><i data-feather="plus"></i></button>
+                    </div>
+                    <ul id="layers-list">
+                        <!-- Layer items will be dynamically inserted here -->
+                    </ul>
+                </div>
+
+                <div id="radial-toolbar">
+                    <div id="color-display-wrapper">
+                        <div id="color-display"></div>
+                    </div>
+                </div>
+                <div id="simple-color-picker" class="color-picker-popup"></div>
+
+                <!-- ADDED: Selection Toolbar -->
+                <div id="selection-toolbar" class="bottom-bar-group">
+                    <button id="selection-delete-btn" class="control-button" title="Delete Selection"><i data-feather="trash"></i></button>
+                    <div class="toolbox-separator"></div>
+                    <div id="selection-color-wrapper" class="control-button" title="Change Color">
+                        <div id="selection-color-display"></div>
+                    </div>
+                </div>
+                <!-- ADDED: Selection Color Picker -->
+                <div id="selection-color-picker" class="color-picker-popup"></div>
+            </div>
+
+            <div id="revisions-view" class="view active"></div>
+        </main>
+    </div>
+
+    <!-- Custom Modal HTML -->
+    <div id="custom-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h3 id="modal-title" class="modal-title">Modal Title</h3>
+            <div id="modal-body" class="modal-body"></div>
+            <div id="modal-actions" class="modal-actions"></div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
