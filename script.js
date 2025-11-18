@@ -337,7 +337,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const indexByteLength = data.indices.length * 4; // Uint32
 
             // Cleanup old buffers if they exist (e.g. drawing in progress updates)
-            if (stroke.gpuData) {
+            if (stroke.gpuData && stroke.gpuData.vertexBuffer instanceof GPUBuffer) {
                 stroke.gpuData.vertexBuffer.destroy();
                 stroke.gpuData.indexBuffer.destroy();
             }
@@ -446,7 +446,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (layer.isVisible) {
                         (layer.strokes || []).forEach(stroke => {
                             // KEY CHANGE: Lazy init and reuse buffers
-                            if (!stroke.gpuData) {
+                            // Check if gpuData is valid AND holds real GPUBuffers. 
+                            // If it was loaded from localStorage, it might be a plain object with empty {} props.
+                            const isValidGPUData = stroke.gpuData && 
+                                                 stroke.gpuData.vertexBuffer instanceof GPUBuffer && 
+                                                 stroke.gpuData.indexBuffer instanceof GPUBuffer;
+
+                            if (!isValidGPUData) {
                                 this.updateStrokeBuffers(stroke);
                             }
                             
@@ -522,9 +528,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function saveData() {
         try {
-            // NOTE: We do NOT save 'gpuData' to localStorage. JSON.stringify skips it automatically.
-            // When loaded, gpuData is undefined, so it will regenerate on first render. Perfect.
-            localStorage.setItem('advancedLearningAppData', JSON.stringify(appData));
+            // NOTE: We do NOT save 'gpuData' to localStorage. 
+            // We use a replacer to strip it out, otherwise it saves as empty objects which causes errors on load.
+            const replacer = (key, value) => {
+                if (key === 'gpuData') return undefined;
+                return value;
+            };
+            localStorage.setItem('advancedLearningAppData', JSON.stringify(appData, replacer));
         } catch (e) {
             console.error("An error occurred while saving data:", e);
             if (e.name === 'QuotaExceededError') {
