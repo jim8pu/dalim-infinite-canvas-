@@ -10,6 +10,140 @@ document.addEventListener('DOMContentLoaded', () => {
     const lerp = (a, b, t) => a + (b - a) * t;
     const getUniqueId = () => Date.now() + Math.random();
 
+    // --- ZOOM FLOOR SYSTEM (Infinite Zoom) ---
+    const FLOOR_BASE = 1000; // Zoom multiplier per floor
+
+    class ZoomFloor {
+        constructor(index, originInParent = { x: 0, y: 0 }, parent = null) {
+            this.index = index;
+            this.parent = parent;
+            this.child = null;
+            this.originInParent = { ...originInParent };
+            this.BASE = FLOOR_BASE;
+        }
+
+        getOrCreateChild(originInParent) {
+            if (!this.child) {
+                this.child = new ZoomFloor(this.index + 1, originInParent, this);
+            } else {
+                // Check if any strokes exist on the child floor
+                // If no strokes, re-center the child's origin
+                if (!this.child._hasStrokes) {
+                    this.child.originInParent = { ...originInParent };
+                    this.child.child = null; // Reset deeper floors too
+                }
+            }
+            return this.child;
+        }
+
+        toJSON() {
+            return {
+                index: this.index,
+                originInParent: { ...this.originInParent },
+                child: this.child ? this.child.toJSON() : null,
+            };
+        }
+
+        static fromJSON(data, parent = null) {
+            if (!data) return null;
+            const floor = new ZoomFloor(data.index, data.originInParent, parent);
+            if (data.child) {
+                floor.child = ZoomFloor.fromJSON(data.child, floor);
+            }
+            return floor;
+        }
+
+        getRoot() {
+            let f = this;
+            while (f.parent) f = f.parent;
+            return f;
+        }
+
+        getFloorByIndex(targetIndex) {
+            let f = this.getRoot();
+            if (targetIndex < f.index) return null;
+            while (f && f.index < targetIndex) f = f.child;
+            return (f && f.index === targetIndex) ? f : null;
+        }
+    }
+
+    // Transforms a world point from its native floor to the target floor
+    // Resolves coordinates continuously in Float64 precisely avoiding GPU matrix Float32 accuracy limits
+    function transformPointToFloor(pt, srcFloorIndex, dstFloor) {
+        let p = { x: pt.x, y: pt.y };
+        let f = dstFloor.getRoot().getFloorByIndex(srcFloorIndex);
+        if (!f) return p;
+
+        if (srcFloorIndex < dstFloor.index) {
+            // Walk down (zoom deeper)
+            while (f && f.index < dstFloor.index && f.child) {
+                f = f.child;
+                p.x = (p.x - f.originInParent.x) * f.BASE;
+                p.y = (p.y - f.originInParent.y) * f.BASE;
+            }
+        } else if (srcFloorIndex > dstFloor.index) {
+            // Walk up (zoom out)
+            while (f && f.index > dstFloor.index && f.parent) {
+                p.x = p.x / f.BASE + f.originInParent.x;
+                p.y = p.y / f.BASE + f.originInParent.y;
+                f = f.parent;
+            }
+        }
+        return p;
+    }
+
+    // Perform floor transition on both current and target view values
+    function transitionFloor(viewState, direction) {
+        const dpr = window.devicePixelRatio || 1;
+        const canvas = $('#canvas');
+        const w = canvas.width / dpr;
+        const h = canvas.height / dpr;
+        const screenCenterX = w / 2;
+        const screenCenterY = h / 2;
+
+        if (direction === 'up') {
+            // Zoom IN: create/enter child floor
+            // The child's origin = where we're looking in current floor coords
+            const worldCenterX = (screenCenterX - viewState.panOffset.x) / viewState.scale;
+            const worldCenterY = (screenCenterY - viewState.panOffset.y) / viewState.scale;
+
+            const child = viewState.currentFloor.getOrCreateChild({ x: worldCenterX, y: worldCenterY });
+
+            // Transform CURRENT values
+            viewState.scale /= FLOOR_BASE;
+            viewState.panOffset.x = screenCenterX; // Origin at center
+            viewState.panOffset.y = screenCenterY;
+
+            // Transform TARGET values
+            const targetWorldCenterX = (screenCenterX - viewState.targetPanOffset.x) / viewState.targetScale;
+            const targetWorldCenterY = (screenCenterY - viewState.targetPanOffset.y) / viewState.targetScale;
+            const targetChildX = (targetWorldCenterX - worldCenterX) * FLOOR_BASE;
+            const targetChildY = (targetWorldCenterY - worldCenterY) * FLOOR_BASE;
+            viewState.targetScale /= FLOOR_BASE;
+            viewState.targetPanOffset.x = screenCenterX - targetChildX * viewState.targetScale;
+            viewState.targetPanOffset.y = screenCenterY - targetChildY * viewState.targetScale;
+
+            viewState.currentFloor = child;
+        } else if (direction === 'down' && viewState.currentFloor.parent) {
+            // Zoom OUT: return to parent floor
+            const origin = viewState.currentFloor.originInParent;
+
+            // Transform CURRENT values
+            const newScale = viewState.scale * FLOOR_BASE;
+            viewState.panOffset.x = viewState.panOffset.x - origin.x * newScale;
+            viewState.panOffset.y = viewState.panOffset.y - origin.y * newScale;
+            viewState.scale = newScale;
+
+            // Transform TARGET values
+            const newTargetScale = viewState.targetScale * FLOOR_BASE;
+            viewState.targetPanOffset.x = viewState.targetPanOffset.x - origin.x * newTargetScale;
+            viewState.targetPanOffset.y = viewState.targetPanOffset.y - origin.y * newTargetScale;
+            viewState.targetScale = newTargetScale;
+
+            viewState.currentFloor = viewState.currentFloor.parent;
+        }
+    }
+
     // --- NEW: WebGPU Renderer Class ---
     class WebGPURenderer {
         constructor(canvas) {
@@ -122,6 +256,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 size: this.maxOverlayVertices * 6 * 4,
                 usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             });
+
+            // --- Depth-Stencil Texture for overdraw prevention ---
+            this._createDepthStencilTexture();
+            this.stencilRef = 0; // Incrementing stencil reference counter
+        }
+
+        _createDepthStencilTexture() {
+            if (this.depthStencilTexture) {
+                this.depthStencilTexture.destroy();
+            }
+            this.depthStencilTexture = this.device.createTexture({
+                size: {
+                    width: Math.max(1, this.canvas.width),
+                    height: Math.max(1, this.canvas.height),
+                },
+                format: 'depth24plus-stencil8',
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+            this.depthStencilView = this.depthStencilTexture.createView();
         }
 
         createPipelines() {
@@ -166,7 +319,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 },
             };
 
-            // --- Stroke Pipeline (Triangles) ---
+            // --- Stroke Pipeline (Triangles) with stencil for overdraw prevention ---
             this.pipeline = this.device.createRenderPipeline({
                 layout: pipelineLayout,
                 vertex: {
@@ -182,9 +335,30 @@ document.addEventListener('DOMContentLoaded', () => {
                 primitive: {
                     topology: 'triangle-list',
                 },
+                depthStencil: {
+                    format: 'depth24plus-stencil8',
+                    depthWriteEnabled: false,
+                    depthCompare: 'always',
+                    stencilFront: {
+                        compare: 'not-equal',
+                        failOp: 'keep',
+                        passOp: 'replace',
+                        depthFailOp: 'keep',
+                    },
+                    stencilBack: {
+                        compare: 'not-equal',
+                        failOp: 'keep',
+                        passOp: 'replace',
+                        depthFailOp: 'keep',
+                    },
+                    stencilReadMask: 0xFF,
+                    stencilWriteMask: 0xFF,
+                },
             });
 
             // --- Overlay Pipeline (Lines) ---
+            // Must include depthStencil for render pass compatibility,
+            // but stencil always passes and never writes (overlays draw freely)
             this.overlayPipeline = this.device.createRenderPipeline({
                 layout: pipelineLayout,
                 vertex: {
@@ -200,6 +374,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 primitive: {
                     topology: 'line-list',
                 },
+                depthStencil: {
+                    format: 'depth24plus-stencil8',
+                    depthWriteEnabled: false,
+                    depthCompare: 'always',
+                    stencilFront: {
+                        compare: 'always',
+                        failOp: 'keep',
+                        passOp: 'keep',
+                        depthFailOp: 'keep',
+                    },
+                    stencilBack: {
+                        compare: 'always',
+                        failOp: 'keep',
+                        passOp: 'keep',
+                        depthFailOp: 'keep',
+                    },
+                    stencilReadMask: 0x00,
+                    stencilWriteMask: 0x00,
+                },
             });
         }
         
@@ -209,72 +402,338 @@ document.addEventListener('DOMContentLoaded', () => {
             this.canvas.height = Math.round(height * dpr);
             this.canvas.style.width = `${width}px`;
             this.canvas.style.height = `${height}px`;
+            // Recreate depth-stencil texture to match new canvas size
+            if (this.device) {
+                this._createDepthStencilTexture();
+            }
         }
 
         // --- MODIFIED: Data-Returning Tessellators ---
         // These now return arrays instead of pushing to a global buffer
 
-        tessellatePenStroke(stroke) {
+        // --- Catmull-Rom Spline Subdivision (Zoom-Aware + View-Frustum Culled) ---
+        // screenScale: combined scale factor (cameraScale * floorEffScale) to convert world→screen px
+        // viewRect: { minX, minY, maxX, maxY } visible world-space rectangle (null = subdivide all)
+        // Target: each subdivided segment ≤ 3 screen pixels. Off-screen segments get 1 subdivision.
+        catmullRomSubdivide(points, screenScale, viewRect) {
+            if (points.length < 2) return points;
+
+            const TARGET_SCREEN_PX = 3;
+            // Expand view rect by a margin so we don't get edge artifacts
+            let vr = null;
+            if (viewRect) {
+                const margin = 50 / screenScale; // 50 screen px margin in world units
+                vr = {
+                    minX: viewRect.minX - margin,
+                    minY: viewRect.minY - margin,
+                    maxX: viewRect.maxX + margin,
+                    maxY: viewRect.maxY + margin,
+                };
+            }
+
+            if (points.length === 2) {
+                const d = Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y);
+                const screenDist = d * screenScale;
+                const steps = Math.max(1, Math.min(256, Math.round(screenDist / TARGET_SCREEN_PX)));
+                const result = [];
+                for (let t = 0; t <= steps; t++) {
+                    const frac = t / steps;
+                    result.push({
+                        x: points[0].x + (points[1].x - points[0].x) * frac,
+                        y: points[0].y + (points[1].y - points[0].y) * frac,
+                    });
+                }
+                return result;
+            }
+
+            const result = [];
+            const n = points.length;
+
+            for (let i = 0; i < n - 1; i++) {
+                const p0 = points[Math.max(0, i - 1)];
+                const p1 = points[i];
+                const p2 = points[i + 1];
+                const p3 = points[Math.min(n - 1, i + 2)];
+
+                const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+
+                // --- View-frustum culling per segment ---
+                // Check if the segment bounding box (P0..P3 control points) is visible
+                let isVisible = true;
+                if (vr) {
+                    const segMinX = Math.min(p0.x, p1.x, p2.x, p3.x);
+                    const segMaxX = Math.max(p0.x, p1.x, p2.x, p3.x);
+                    const segMinY = Math.min(p0.y, p1.y, p2.y, p3.y);
+                    const segMaxY = Math.max(p0.y, p1.y, p2.y, p3.y);
+                    isVisible = !(segMaxX < vr.minX || segMinX > vr.maxX ||
+                                  segMaxY < vr.minY || segMinY > vr.maxY);
+                }
+
+                let steps;
+                if (isVisible) {
+                    // Visible: subdivide at screen-space density
+                    const screenDist = dist * screenScale;
+                    steps = Math.max(1, Math.min(256, Math.round(screenDist / TARGET_SCREEN_PX)));
+                } else {
+                    // Off-screen: minimal subdivision (just emit endpoints)
+                    steps = 1;
+                }
+
+                for (let s = 0; s < steps; s++) {
+                    const t = s / steps;
+                    const t2 = t * t;
+                    const t3 = t2 * t;
+
+                    const x = 0.5 * (
+                        (2 * p1.x) +
+                        (-p0.x + p2.x) * t +
+                        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+                        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3
+                    );
+                    const y = 0.5 * (
+                        (2 * p1.y) +
+                        (-p0.y + p2.y) * t +
+                        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+                        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3
+                    );
+                    result.push({ x, y });
+                }
+            }
+            // Always include the very last point
+            result.push({ x: points[n - 1].x, y: points[n - 1].y });
+            return result;
+        }
+
+        tessellatePenStroke(stroke, cameraFloor, cameraScale) {
             const vertices = [];
             const indices = [];
             
             const points = stroke.points;
             if (points.length < 2) return { vertices, indices };
 
-            const color = this.hexToRgba(stroke.color, (stroke.opacity / 100) * (stroke.isErasing ? 0.3 : 1.0));
-            const lineWidth = stroke.lineWidth / 2;
-            
-            // We restart indexing from 0 for each individual stroke buffer
-            let baseIndex = 0;
+            const rawTransformed = points.map(pt => transformPointToFloor(pt, stroke.floorIndex, cameraFloor));
 
-            for (let i = 0; i < points.length; i++) {
-                const p = points[i];
+            const color = this.hexToRgba(stroke.color, (stroke.opacity / 100) * (stroke.isErasing ? 0.3 : 1.0));
+            let effScale = 1;
+            if (stroke.floorIndex < cameraFloor.index) {
+                effScale = Math.pow(cameraFloor.BASE, cameraFloor.index - stroke.floorIndex);
+            } else if (stroke.floorIndex > cameraFloor.index) {
+                effScale = 1 / Math.pow(cameraFloor.BASE, stroke.floorIndex - cameraFloor.index);
+            }
+            const actualWidth = stroke.worldWidth !== undefined ? stroke.worldWidth : stroke.lineWidth;
+            const halfWidth = (actualWidth * effScale) / 2;
+
+            // --- Zoom-aware subdivision ---
+            // Combined scale: how many screen pixels per world unit
+            const screenScale = (cameraScale || 1) * effScale;
+
+            // Compute visible world-space rectangle for view-frustum culling
+            const dpr = window.devicePixelRatio || 1;
+            const canvasW = this.canvas.width / dpr;
+            const canvasH = this.canvas.height / dpr;
+            const cameraPanX = this._lastPanX || 0;
+            const cameraPanY = this._lastPanY || 0;
+            const viewRect = {
+                minX: -cameraPanX / cameraScale,
+                minY: -cameraPanY / cameraScale,
+                maxX: (canvasW - cameraPanX) / cameraScale,
+                maxY: (canvasH - cameraPanY) / cameraScale,
+            };
+
+            const transformedPoints = this.catmullRomSubdivide(rawTransformed, screenScale, viewRect);
+            
+            const len = transformedPoints.length;
+
+            // --- Build quad strip (same logic, uses subdivided points) ---
+            // Precompute per-point normals
+            const normals = new Array(len);
+            for (let i = 0; i < len; i++) {
+                const p = transformedPoints[i];
                 let nx = 0, ny = 0;
-                
-                if (i === 0) { 
-                    if (points.length > 1) {
-                        const next = points[i + 1];
-                        nx = next.y - p.y; ny = p.x - next.x;
-                    }
-                } else if (i === points.length - 1) {
-                    const prev = points[i - 1];
+                if (i === 0) {
+                    const next = transformedPoints[1];
+                    nx = next.y - p.y; ny = p.x - next.x;
+                } else if (i === len - 1) {
+                    const prev = transformedPoints[i - 1];
                     nx = p.y - prev.y; ny = prev.x - p.x;
                 } else {
-                    const prev = points[i - 1];
-                    const next = points[i + 1];
-                    let tx = next.x - prev.x; let ty = next.y - prev.y;
-                    nx = -ty; ny = tx;
+                    const prev = transformedPoints[i - 1];
+                    const next = transformedPoints[i + 1];
+                    nx = -(next.y - prev.y); ny = next.x - prev.x;
                 }
-                
-                const len = Math.hypot(nx, ny);
-                if (len > 0.001) { nx /= len; ny /= len; } 
+                const nLen = Math.hypot(nx, ny);
+                if (nLen > 0.001) { nx /= nLen; ny /= nLen; }
                 else { nx = 1; ny = 0; }
+                normals[i] = { x: nx, y: ny };
+            }
 
-                vertices.push(p.x + nx * lineWidth, p.y + ny * lineWidth, ...color);
-                vertices.push(p.x - nx * lineWidth, p.y - ny * lineWidth, ...color);
+            // Emit quad strip vertices
+            for (let i = 0; i < len; i++) {
+                const p = transformedPoints[i];
+                const n = normals[i];
+                vertices.push(p.x + n.x * halfWidth, p.y + n.y * halfWidth, ...color);
+                vertices.push(p.x - n.x * halfWidth, p.y - n.y * halfWidth, ...color);
+            }
 
-                if (i > 0) {
-                    const i0 = baseIndex + (i - 1) * 2;
-                    const i1 = i0 + 1;
-                    const i2 = baseIndex + i * 2;
-                    const i3 = i2 + 1;
-                    indices.push(i0, i1, i2);
-                    indices.push(i1, i3, i2);
+            // Emit quad strip indices
+            for (let i = 1; i < len; i++) {
+                const i0 = (i - 1) * 2;
+                const i1 = i0 + 1;
+                const i2 = i * 2;
+                const i3 = i2 + 1;
+                indices.push(i0, i1, i2);
+                indices.push(i1, i3, i2);
+            }
+
+            // --- Change 3: Round joins at interior bends ---
+            // At each interior vertex where angle between segments exceeds ~5°,
+            // insert a triangle fan on the outer side spanning the angular gap.
+            const ANGLE_THRESHOLD = 0.087; // ~5 degrees in radians
+            for (let i = 1; i < len - 1; i++) {
+                const prev = transformedPoints[i - 1];
+                const curr = transformedPoints[i];
+                const next = transformedPoints[i + 1];
+
+                // Incoming and outgoing directions
+                const dInX = curr.x - prev.x, dInY = curr.y - prev.y;
+                const dOutX = next.x - curr.x, dOutY = next.y - curr.y;
+                const dInLen = Math.hypot(dInX, dInY);
+                const dOutLen = Math.hypot(dOutX, dOutY);
+                if (dInLen < 0.001 || dOutLen < 0.001) continue;
+
+                const inDirX = dInX / dInLen, inDirY = dInY / dInLen;
+                const outDirX = dOutX / dOutLen, outDirY = dOutY / dOutLen;
+
+                // Angle between incoming and outgoing
+                let dot = inDirX * outDirX + inDirY * outDirY;
+                dot = Math.max(-1, Math.min(1, dot));
+                const angle = Math.acos(dot);
+                if (angle < ANGLE_THRESHOLD) continue;
+
+                // Cross product sign determines which side is "outer"
+                const cross = inDirX * outDirY - inDirY * outDirX;
+
+                // Incoming normal (perpendicular to incoming direction)
+                let inNx = -inDirY, inNy = inDirX;
+                // Outgoing normal (perpendicular to outgoing direction)
+                let outNx = -outDirY, outNy = outDirX;
+
+                // Flip normals to outer side based on cross product
+                if (cross > 0) {
+                    inNx = -inNx; inNy = -inNy;
+                    outNx = -outNx; outNy = -outNy;
+                }
+
+                // Number of fan segments proportional to angle
+                const fanSegments = Math.max(4, Math.min(8, Math.round(angle / (Math.PI / 8))));
+
+                // Angles of the two normals
+                const startAngle = Math.atan2(inNy, inNx);
+                let endAngle = Math.atan2(outNy, outNx);
+
+                // Ensure we sweep in the correct (shorter) direction
+                let sweep = endAngle - startAngle;
+                if (cross > 0) {
+                    // For positive cross, sweep should be positive
+                    if (sweep < 0) sweep += 2 * Math.PI;
+                } else {
+                    // For negative cross, sweep should be negative
+                    if (sweep > 0) sweep -= 2 * Math.PI;
+                }
+
+                // Center vertex of the fan = the joint point
+                const centerIdx = vertices.length / 6;
+                vertices.push(curr.x, curr.y, ...color);
+
+                // Perimeter vertices
+                for (let s = 0; s <= fanSegments; s++) {
+                    const a = startAngle + (sweep * s) / fanSegments;
+                    vertices.push(
+                        curr.x + Math.cos(a) * halfWidth,
+                        curr.y + Math.sin(a) * halfWidth,
+                        ...color
+                    );
+                }
+
+                // Fan triangles
+                for (let s = 0; s < fanSegments; s++) {
+                    indices.push(centerIdx, centerIdx + 1 + s, centerIdx + 2 + s);
                 }
             }
+
+            // --- Change 2: Round caps at endpoints ---
+            const CAP_SEGMENTS = 12;
+            // Cap at the start (faces backward)
+            {
+                const p0 = transformedPoints[0];
+                const p1 = transformedPoints[1];
+                const dirX = p1.x - p0.x, dirY = p1.y - p0.y;
+                const dLen = Math.hypot(dirX, dirY);
+                // Cap faces backward (away from stroke direction)
+                let capDirX = 0, capDirY = -1;
+                if (dLen > 0.001) {
+                    capDirX = -dirX / dLen;
+                    capDirY = -dirY / dLen;
+                }
+                // Semicircle spans 180° centered on capDir
+                const capCenterAngle = Math.atan2(capDirY, capDirX);
+                const centerIdx = vertices.length / 6;
+                vertices.push(p0.x, p0.y, ...color);
+                for (let s = 0; s <= CAP_SEGMENTS; s++) {
+                    const a = capCenterAngle - Math.PI / 2 + (Math.PI * s) / CAP_SEGMENTS;
+                    vertices.push(
+                        p0.x + Math.cos(a) * halfWidth,
+                        p0.y + Math.sin(a) * halfWidth,
+                        ...color
+                    );
+                }
+                for (let s = 0; s < CAP_SEGMENTS; s++) {
+                    indices.push(centerIdx, centerIdx + 1 + s, centerIdx + 2 + s);
+                }
+            }
+            // Cap at the end (faces forward)
+            {
+                const pLast = transformedPoints[len - 1];
+                const pPrev = transformedPoints[len - 2];
+                const dirX = pLast.x - pPrev.x, dirY = pLast.y - pPrev.y;
+                const dLen = Math.hypot(dirX, dirY);
+                let capDirX = 0, capDirY = 1;
+                if (dLen > 0.001) {
+                    capDirX = dirX / dLen;
+                    capDirY = dirY / dLen;
+                }
+                const capCenterAngle = Math.atan2(capDirY, capDirX);
+                const centerIdx = vertices.length / 6;
+                vertices.push(pLast.x, pLast.y, ...color);
+                for (let s = 0; s <= CAP_SEGMENTS; s++) {
+                    const a = capCenterAngle - Math.PI / 2 + (Math.PI * s) / CAP_SEGMENTS;
+                    vertices.push(
+                        pLast.x + Math.cos(a) * halfWidth,
+                        pLast.y + Math.sin(a) * halfWidth,
+                        ...color
+                    );
+                }
+                for (let s = 0; s < CAP_SEGMENTS; s++) {
+                    indices.push(centerIdx, centerIdx + 1 + s, centerIdx + 2 + s);
+                }
+            }
+
             return { vertices, indices };
         }
         
-        tessellateShape(shape) {
+        tessellateShape(shape, cameraFloor) {
             const vertices = [];
             const indices = [];
             const color = this.hexToRgba(shape.color, (shape.opacity / 100) * (shape.isErasing ? 0.3 : 1.0));
             let baseIndex = 0;
 
-            let x = Math.min(shape.x, shape.x + shape.width);
-            let y = Math.min(shape.y, shape.y + shape.height);
-            let w = Math.abs(shape.width);
-            let h = Math.abs(shape.height);
+            const p1 = transformPointToFloor({x: shape.x, y: shape.y}, shape.floorIndex || 0, cameraFloor);
+            const p2 = transformPointToFloor({x: shape.x + shape.width, y: shape.y + shape.height}, shape.floorIndex || 0, cameraFloor);
+
+            let x = Math.min(p1.x, p2.x);
+            let y = Math.min(p1.y, p2.y);
+            let w = Math.abs(p2.x - p1.x);
+            let h = Math.abs(p2.y - p1.y);
 
             switch (shape.type) {
                 case 'rectangle':
@@ -310,14 +769,14 @@ document.addEventListener('DOMContentLoaded', () => {
             return { vertices, indices };
         }
 
-        // --- NEW: Helper to upload a specific stroke to GPU ---
-        updateStrokeBuffers(stroke) {
+        // --- Helper to upload a specific stroke to GPU ---
+        updateStrokeBuffers(stroke, cameraFloor, cameraScale) {
             // 1. Tessellate on CPU to get data arrays
             let data;
             if (stroke.type === 'pen' || stroke.type === 'highlighter') {
-                data = this.tessellatePenStroke(stroke);
+                data = this.tessellatePenStroke(stroke, cameraFloor, cameraScale);
             } else {
-                data = this.tessellateShape(stroke);
+                data = this.tessellateShape(stroke, cameraFloor);
             }
 
             // If no geometry, nullify and return
@@ -331,19 +790,16 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // 2. Create GPU buffers
-            // We use `mappedAtCreation: true` for efficient initialization
-            
-            const vertexByteLength = data.vertices.length * 4; // Float32
-            const indexByteLength = data.indices.length * 4; // Uint32
+            const vertexByteLength = data.vertices.length * 4;
+            const indexByteLength = data.indices.length * 4;
 
-            // Cleanup old buffers if they exist (e.g. drawing in progress updates)
             if (stroke.gpuData && stroke.gpuData.vertexBuffer instanceof GPUBuffer) {
                 stroke.gpuData.vertexBuffer.destroy();
                 stroke.gpuData.indexBuffer.destroy();
             }
 
             const vertexBuffer = this.device.createBuffer({
-                size: (vertexByteLength + 3) & ~3, // Align to 4 bytes
+                size: (vertexByteLength + 3) & ~3,
                 usage: GPUBufferUsage.VERTEX,
                 mappedAtCreation: true,
             });
@@ -358,11 +814,13 @@ document.addEventListener('DOMContentLoaded', () => {
             new Uint32Array(indexBuffer.getMappedRange()).set(data.indices);
             indexBuffer.unmap();
 
-            // 3. Store on stroke object
+            // 3. Store on stroke object — include tessellationScale for zoom-aware cache invalidation
             stroke.gpuData = {
                 vertexBuffer,
                 indexBuffer,
-                indexCount: data.indices.length
+                indexCount: data.indices.length,
+                floorIndex: cameraFloor.index,
+                tessellationScale: cameraScale || 1,
             };
         }
 
@@ -398,46 +856,58 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        // --- NEW: Render Function ---
+        // --- Build view-projection matrix from scale + pan ---
+        buildMatrix(scale, panX, panY) {
+            const dpr = window.devicePixelRatio || 1;
+            const w = this.canvas.width / dpr;
+            const h = this.canvas.height / dpr;
+            return new Float32Array([
+                2 * scale / w, 0, 0, 0,
+                0, -2 * scale / h, 0, 0,
+                0, 0, -1, 0,
+                (2 * panX / w) - 1, (-2 * panY / h) + 1, 0, 1
+            ]);
+        }
+
+        // --- Render Function (Unified Camera Space) ---
         render(viewState, layers, laserPoints, lassoPoints, selectionBox, tempShape) {
             if (!this.device) return;
 
-            // --- 1. Update View Uniform ---
-            const { panOffset, scale } = viewState;
-            const dpr = window.devicePixelRatio || 1;
-            const logicalWidth = this.canvas.width / dpr;
-            const logicalHeight = this.canvas.height / dpr;
-            
-            const w = logicalWidth;
-            const h = logicalHeight;
-            const sx = scale; const sy = scale;
-            const tx = panOffset.x; const ty = panOffset.y;
+            const cameraFloor = viewState.currentFloor;
+            const cameraScale = viewState.scale;
+            const cameraPan = viewState.panOffset;
 
-            const viewProjectionMatrix = new Float32Array([
-                2 * sx / w, 0, 0, 0,
-                0, -2 * sy / h, 0, 0,
-                0, 0, -1, 0,
-                (2 * tx / w) - 1, (-2 * ty / h) + 1, 0, 1
-            ]);
+            // Store pan for use by tessellatePenStroke's view-rect computation
+            this._lastPanX = cameraPan.x;
+            this._lastPanY = cameraPan.y;
             
-            this.device.queue.writeBuffer(this.viewUniformBuffer, 0, viewProjectionMatrix);
+            const matrix = this.buildMatrix(cameraScale, cameraPan.x, cameraPan.y);
+            this.device.queue.writeBuffer(this.viewUniformBuffer, 0, matrix);
 
-            // --- 2. Begin Render Pass ---
             const commandEncoder = this.device.createCommandEncoder();
             const textureView = this.context.getCurrentTexture().createView();
-            
-            const renderPassDescriptor = {
+
+            // --- Stencil-enabled render pass ---
+            this.stencilRef = 0;
+
+            const passEncoder = commandEncoder.beginRenderPass({
                 colorAttachments: [{
                     view: textureView,
                     clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
                     loadOp: 'clear',
                     storeOp: 'store',
                 }],
-            };
+                depthStencilAttachment: {
+                    view: this.depthStencilView,
+                    depthLoadOp: 'clear',
+                    depthClearValue: 1.0,
+                    depthStoreOp: 'store',
+                    stencilLoadOp: 'clear',
+                    stencilClearValue: 0,
+                    stencilStoreOp: 'store',
+                },
+            });
 
-            const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
-
-            // --- 3. Draw Strokes (Iterate and use cached buffers) ---
             passEncoder.setPipeline(this.pipeline);
             passEncoder.setBindGroup(0, this.viewBindGroup);
 
@@ -445,19 +915,31 @@ document.addEventListener('DOMContentLoaded', () => {
                 layers.forEach(layer => {
                     if (layer.isVisible) {
                         (layer.strokes || []).forEach(stroke => {
-                            // KEY CHANGE: Lazy init and reuse buffers
-                            // Check if gpuData is valid AND holds real GPUBuffers. 
-                            // If it was loaded from localStorage, it might be a plain object with empty {} props.
-                            const isValidGPUData = stroke.gpuData && 
-                                                 stroke.gpuData.vertexBuffer instanceof GPUBuffer && 
-                                                 stroke.gpuData.indexBuffer instanceof GPUBuffer;
+                            const floorDelta = (stroke.floorIndex || 0) - cameraFloor.index;
+                            if (floorDelta > 2) return;
 
-                            if (!isValidGPUData) {
-                                this.updateStrokeBuffers(stroke);
+                            // --- Zoom-aware cache invalidation ---
+                            // Re-tessellate if: no gpuData, floor changed, OR zoom changed by >1.5x
+                            let needsRetessellation = !stroke.gpuData ||
+                                stroke.gpuData.floorIndex !== cameraFloor.index ||
+                                !(stroke.gpuData.vertexBuffer instanceof GPUBuffer);
+
+                            if (!needsRetessellation && stroke.gpuData.tessellationScale) {
+                                const zoomRatio = cameraScale / stroke.gpuData.tessellationScale;
+                                if (zoomRatio > 1.5 || zoomRatio < (1 / 1.5)) {
+                                    needsRetessellation = true;
+                                }
                             }
-                            
-                            // Only draw if valid data exists
+
+                            if (needsRetessellation) {
+                                this.updateStrokeBuffers(stroke, cameraFloor, cameraScale);
+                            }
+
                             if (stroke.gpuData && stroke.gpuData.indexCount > 0) {
+                                this.stencilRef++;
+                                if (this.stencilRef > 255) this.stencilRef = 1;
+                                passEncoder.setStencilReference(this.stencilRef);
+
                                 passEncoder.setVertexBuffer(0, stroke.gpuData.vertexBuffer);
                                 passEncoder.setIndexBuffer(stroke.gpuData.indexBuffer, 'uint32');
                                 passEncoder.drawIndexed(stroke.gpuData.indexCount, 1, 0, 0, 0);
@@ -466,19 +948,25 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 });
             }
-            
-            // Handle temporary shape (currently drawing)
+
             if (tempShape) {
-                // We must update this every frame as it changes
-                this.updateStrokeBuffers(tempShape);
-                if (tempShape.gpuData && tempShape.gpuData.indexCount > 0) {
-                     passEncoder.setVertexBuffer(0, tempShape.gpuData.vertexBuffer);
-                     passEncoder.setIndexBuffer(tempShape.gpuData.indexBuffer, 'uint32');
-                     passEncoder.drawIndexed(tempShape.gpuData.indexCount, 1, 0, 0, 0);
+                const floorDelta = (tempShape.floorIndex || 0) - cameraFloor.index;
+                if (floorDelta <= 2) {
+                    this.updateStrokeBuffers(tempShape, cameraFloor, cameraScale);
+                    if (tempShape.gpuData && tempShape.gpuData.indexCount > 0) {
+                        this.stencilRef++;
+                        if (this.stencilRef > 255) this.stencilRef = 1;
+                        passEncoder.setStencilReference(this.stencilRef);
+
+                        passEncoder.setVertexBuffer(0, tempShape.gpuData.vertexBuffer);
+                        passEncoder.setIndexBuffer(tempShape.gpuData.indexBuffer, 'uint32');
+                        passEncoder.drawIndexed(tempShape.gpuData.indexCount, 1, 0, 0, 0);
+                    }
                 }
             }
 
-            // --- 4. Draw Overlays (Dynamic) ---
+            // --- Draw Overlays (already in camera's own coordinate space) ---
+            // Overlays use a separate pipeline without stencil — no changes needed
             const overlayVertices = [];
             if (laserPoints) this.tessellateLaser(laserPoints, overlayVertices);
             if (lassoPoints) this.tessellateLasso(lassoPoints, overlayVertices);
@@ -522,7 +1010,9 @@ document.addEventListener('DOMContentLoaded', () => {
             layers: [{ id: firstLayerId, name: 'Layer 1', isVisible: true, strokes: [] }],
             activeLayerId: firstLayerId,
             panOffset: { x: 0, y: 0 }, 
-            scale: 1
+            scale: 1,
+            floorTree: new ZoomFloor(0).toJSON(),
+            currentFloorIndex: 0
         };
     }
 
@@ -532,6 +1022,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // We use a replacer to strip it out, otherwise it saves as empty objects which causes errors on load.
             const replacer = (key, value) => {
                 if (key === 'gpuData') return undefined;
+                if (key === 'floor' && value instanceof ZoomFloor) return undefined;
                 return value;
             };
             localStorage.setItem('advancedLearningAppData', JSON.stringify(appData, replacer));
@@ -969,6 +1460,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let viewState = {
         scale: 1, panOffset: { x: 0, y: 0 },
         targetScale: 1, targetPanOffset: { x: 0, y: 0 },
+        currentFloor: new ZoomFloor(0),
     };
     
     const activePointers = new Map();
@@ -1160,11 +1652,11 @@ document.addEventListener('DOMContentLoaded', () => {
             
             switch (canvasState.activeTool) {
                 case 'pen': case 'highlighter':
-                    const newStroke = { ...options, type: canvasState.activeTool, points: [canvasState.lastPos], rawPoints: [canvasState.lastPos] };
+                    const newStroke = { ...options, type: canvasState.activeTool, floorIndex: viewState.currentFloor.index, worldWidth: options.lineWidth / viewState.scale, points: [canvasState.lastPos], rawPoints: [canvasState.lastPos] };
                     activeLayer.strokes.push(newStroke);
                     break;
                 case 'rectangle': case 'circle': case 'triangle':
-                    canvasState.tempShape = { ...options, type: canvasState.activeTool, x: canvasState.lastPos.x, y: canvasState.lastPos.y, width: 0, height: 0 };
+                    canvasState.tempShape = { ...options, type: canvasState.activeTool, floorIndex: viewState.currentFloor.index, x: canvasState.lastPos.x, y: canvasState.lastPos.y, width: 0, height: 0 };
                     break;
                 case 'eraser':
                     eraseAt(canvasState.lastPos);
@@ -1198,6 +1690,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const worldPos = { x: (center.x - viewState.targetPanOffset.x) / oldScale, y: (center.y - viewState.targetPanOffset.y) / oldScale };
             viewState.targetPanOffset = { x: center.x - worldPos.x * newTargetScale, y: center.y - worldPos.y * newTargetScale };
             viewState.targetScale = newTargetScale;
+            checkFloorTransitions();
             pinchState.startDistance = newDist;
             redrawRequested = true;
             return;
@@ -1259,6 +1752,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (canvasData) {
                 canvasData.panOffset = { ...viewState.panOffset };
                 canvasData.scale = viewState.scale;
+                canvasData.floorTree = viewState.currentFloor.getRoot().toJSON();
+                canvasData.currentFloorIndex = viewState.currentFloor.index;
                 saveData();
             }
         }
@@ -1347,11 +1842,29 @@ document.addEventListener('DOMContentLoaded', () => {
             const worldPos = { x: (mousePoint.x - viewState.targetPanOffset.x) / oldScale, y: (mousePoint.y - viewState.targetPanOffset.y) / oldScale };
             viewState.targetPanOffset = { x: mousePoint.x - worldPos.x * newTargetScale, y: mousePoint.y - worldPos.y * newTargetScale };
             viewState.targetScale = newTargetScale;
+
+            // --- FLOOR TRANSITIONS ---
+            checkFloorTransitions();
         } else { // Panning
             viewState.targetPanOffset.x -= e.deltaX;
             viewState.targetPanOffset.y -= e.deltaY;
         }
         redrawRequested = true;
+    }
+
+    function checkFloorTransitions() {
+        // Zoom IN: target crossed FLOOR_BASE threshold
+        while (viewState.targetScale >= FLOOR_BASE) {
+            transitionFloor(viewState, 'up');
+        }
+        // Zoom OUT: target dropped below 1.0 and parent exists
+        while (viewState.targetScale < 1.0 && viewState.currentFloor.parent) {
+            transitionFloor(viewState, 'down');
+        }
+        // Clamp minimum zoom at root floor
+        if (!viewState.currentFloor.parent) {
+            viewState.targetScale = Math.max(0.01, viewState.targetScale);
+        }
     }
 
     function eraseAt(pos) {
@@ -1715,7 +2228,17 @@ document.addEventListener('DOMContentLoaded', () => {
             viewState.panOffset.x = lerp(viewState.panOffset.x, viewState.targetPanOffset.x, 0.25);
             viewState.panOffset.y = lerp(viewState.panOffset.y, viewState.targetPanOffset.y, 0.25);
             viewState.scale = lerp(viewState.scale, viewState.targetScale, 0.25);
-            $('#zoom-level-display').textContent = `${Math.round(viewState.scale * 100)}%`;
+            // Show total zoom: FLOOR_BASE^floorIndex * localZoom
+            const totalZoom = Math.pow(FLOOR_BASE, viewState.currentFloor.index) * viewState.scale;
+            if (totalZoom >= 1e9) {
+                $('#zoom-level-display').textContent = `${(totalZoom / 1e9).toFixed(1)}B%`;
+            } else if (totalZoom >= 1e6) {
+                $('#zoom-level-display').textContent = `${(totalZoom / 1e6).toFixed(1)}M%`;
+            } else if (totalZoom >= 1e4) {
+                $('#zoom-level-display').textContent = `${(totalZoom / 1e3).toFixed(1)}K%`;
+            } else {
+                $('#zoom-level-display').textContent = `${Math.round(totalZoom * 100)}%`;
+            }
             needsRedraw = true;
         }
 
@@ -1901,6 +2424,7 @@ document.addEventListener('DOMContentLoaded', () => {
                  const worldPos = { x: (center.x - viewState.targetPanOffset.x) / oldScale, y: (center.y - viewState.targetPanOffset.y) / oldScale };
                  viewState.targetPanOffset = { x: center.x - worldPos.x * newTargetScale, y: center.y - worldPos.y * newTargetScale };
                  viewState.targetScale = newTargetScale;
+                 checkFloorTransitions();
                  redrawRequested = true; 
             }));
 
@@ -2029,7 +2553,24 @@ document.addEventListener('DOMContentLoaded', () => {
             viewState.panOffset = canvasData.panOffset || { x: 0, y: 0 };
             viewState.targetScale = viewState.scale;
             viewState.targetPanOffset = { ...viewState.panOffset };
-            $('#zoom-level-display').textContent = `${Math.round(viewState.scale * 100)}%`;
+            // Restore floor tree
+            if (canvasData.floorTree) {
+                const rootFloor = ZoomFloor.fromJSON(canvasData.floorTree);
+                const targetIndex = canvasData.currentFloorIndex || 0;
+                let floor = rootFloor;
+                while (floor && floor.index < targetIndex && floor.child) floor = floor.child;
+                viewState.currentFloor = floor;
+            } else {
+                viewState.currentFloor = new ZoomFloor(0);
+            }
+            const totalZoom = Math.pow(FLOOR_BASE, viewState.currentFloor.index) * viewState.scale;
+            if (totalZoom >= 1e6) {
+                $('#zoom-level-display').textContent = `${(totalZoom / 1e6).toFixed(1)}M%`;
+            } else if (totalZoom >= 1e4) {
+                $('#zoom-level-display').textContent = `${(totalZoom / 1e3).toFixed(1)}K%`;
+            } else {
+                $('#zoom-level-display').textContent = `${Math.round(totalZoom * 100)}%`;
+            }
             renderLayersPanel();
         }
         setActiveTool('pen');
