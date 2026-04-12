@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+@theme {
+  --color-dark: #000000;
+  --color-panel: #1A1A1A;
+  --color-column: #0A0A0A;
+  --color-border: #2f2f2f;
+  --color-primary: #F0F0F0;
+  --color-secondary: #a0a0a0;
+  --color-blue: #388BFD;
+  --color-red: #f43f5e;
+  --color-purple: #8b5cf6;
+  --color-pink: #ec4899;
+  --color-laser: #f43f5e;
+  --font-sans: "Inter", sans-serif;
+}
+
+@layer base {
+  ::selection {
+    background: rgba(139, 92, 246, 0.4);
+  }
+  
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    background: #000000;
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    background: #2f2f2f;
+    border-radius: 4px;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3f3f46;
+  }
+
+  html, body {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer components {
+  /* Generic custom structural classes */
+  
+  .tool-wedge {
+    @apply fill-panel stroke-none transition-all duration-200 pointer-events-auto;
+  }
+  .tool-group:hover .tool-wedge {
+    fill: rgba(56, 139, 253, 0.1);
+  }
+  .tool-wedge.active {
+    fill: rgba(56, 139, 253, 0.25);
+    @apply stroke-blue stroke-[1.5px];
+  }
+  
+  .tool-icon {
+    @apply stroke-secondary fill-none stroke-[2px] pointer-events-none transition-all duration-200;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .tool-group:hover .tool-icon, 
+  .tool-wedge.active + .tool-icon, 
+  .tool-group .tool-wedge.active ~ svg .tool-icon {
+    @apply stroke-blue;
+  }
+  
+  .tool-separator, .ring-separator {
+    @apply stroke-border stroke-[1.5px] pointer-events-none fill-none;
+  }
+}

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dalim | Infinite Canvas</title>
+    <link rel="icon" type="image/svg+xml" href="images/new.svg">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="m-0 p-0 overflow-hidden h-full font-sans bg-dark text-primary select-none">
+    <div class="flex h-screen">
+        <main class="grow overflow-hidden relative">
+            <div id="canvas-view" class="view hidden w-full h-full relative cursor-crosshair flex flex-col">
+                <canvas id="canvas" class="block w-full h-full touch-none"></canvas>
+                
+                <div class="absolute top-0 left-0 w-full p-4 flex justify-center items-start pointer-events-none box-border">
+                    <div id="top-center-controls" class="flex items-center gap-2 bg-panel border border-border rounded-lg p-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.5)] pointer-events-auto">
+                        <button id="back-to-revisions-btn" class="bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary active:text-blue" title="Back to Revisions"><i data-lucide="arrow-left" class="w-5 h-5"></i></button>
+                        <div class="w-px h-5 bg-border mx-1"></div>
+                        <button id="pan-tool-btn" class="bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary" title="Pan Tool"><i data-lucide="move" class="w-5 h-5"></i></button>
+                        <div class="w-px h-5 bg-border mx-1"></div>
+                        <button class="zoom-btn bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary" data-zoom="out" title="Zoom Out"><i data-lucide="zoom-out" class="w-5 h-5"></i></button>
+                        <div id="zoom-level-display" class="bg-none border-none text-secondary p-2 rounded-md transition-all duration-200 flex items-center justify-center min-w-[50px] text-center default-cursor pointer-events-none">100%</div>
+                        <button class="zoom-btn bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary" data-zoom="in" title="Zoom In"><i data-lucide="zoom-in" class="w-5 h-5"></i></button>
+                        <div class="w-px h-5 bg-border mx-1"></div>
+                        <button id="layers-btn" class="bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary" title="Layers"><i data-lucide="layers" class="w-5 h-5"></i></button>
+                    </div>
+                </div>
+
+                <div id="settings-popup" class="hidden absolute left-[230px] top-[70px] z-[101] bg-panel border border-border rounded-lg p-4 shadow-[0_8px_24px_rgba(0,0,0,0.5)] flex-col gap-3 w-[220px]">
+                    <div class="flex flex-col gap-1" id="pen-size-setting">
+                        <label for="pen-size-slider" class="text-sm font-medium text-secondary">Size</label>
+                        <input type="range" id="pen-size-slider" min="1" max="100" value="5" class="w-full m-0 accent-blue">
+                        <span id="pen-size-value" class="text-xs text-right text-primary">5</span>
+                    </div>
+                    <div class="flex flex-col gap-1" id="opacity-setting">
+                        <label for="opacity-slider" class="text-sm font-medium text-secondary">Opacity</label>
+                        <input type="range" id="opacity-slider" min="1" max="100" step="1" value="100" class="w-full m-0 accent-blue">
+                        <span id="opacity-value" class="text-xs text-right text-primary">100</span>
+                    </div>
+                    <div class="flex flex-col gap-1" id="smoothness-setting">
+                        <label for="smoothness-slider" class="text-sm font-medium text-secondary">Smoothness</label>
+                        <input type="range" id="smoothness-slider" min="1" max="100" step="1" value="50" class="w-full m-0 accent-blue">
+                        <span id="smoothness-value" class="text-xs text-right text-primary">50</span>
+                    </div>
+                </div>
+
+                <div id="layers-panel" class="hidden absolute right-[250px] top-[60px] z-[200] bg-panel border border-border rounded-lg p-4 shadow-[0_8px_24px_rgba(0,0,0,0.5)] flex-col gap-3 w-[220px]">
+                    <div class="flex justify-between items-center mb-2">
+                        <h3 class="m-0 text-base font-semibold">Layers</h3>
+                        <button id="add-layer-btn" class="bg-none border-none text-secondary p-1 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-primary" title="Add New Layer"><i data-lucide="plus" class="w-4 h-4"></i></button>
+                    </div>
+                    <ul id="layers-list" class="list-none p-0 m-0 flex flex-col gap-1 max-h-[300px] overflow-y-auto">
+                        <!-- Dynamic insertions -->
+                    </ul>
+                </div>
+
+                <div id="radial-toolbar" class="absolute top-8 left-8 w-[200px] h-[200px] pointer-events-auto z-[100] select-none transition-opacity duration-300">
+                    <div id="color-display-wrapper" class="absolute top-[76px] left-[76px] w-12 h-12 bg-transparent rounded-full flex items-center justify-center cursor-pointer group">
+                        <div id="color-display" class="w-11 h-11 rounded-full border-2 border-primary transition-transform duration-200 group-hover:scale-110"></div>
+                    </div>
+                </div>
+                
+                <div id="simple-color-picker" class="hidden absolute top-[70px] left-[230px] w-[200px] grid-cols-5 z-[101] p-2.5 bg-panel border border-border rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.5)] gap-2"></div>
+
+                <div id="selection-toolbar" class="absolute bottom-6 left-1/2 -translate-x-1/2 translate-y-2.5 flex items-center gap-2 bg-panel border border-border rounded-lg p-1.5 shadow-[0_8px_24px_rgba(0,0,0,0.5)] pointer-events-none opacity-0 transition-all duration-200 z-50">
+                    <button id="selection-delete-btn" class="bg-none border-none text-secondary p-2 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10 hover:text-red" title="Delete Selection"><i data-lucide="trash" class="w-5 h-5"></i></button>
+                    <div class="w-px h-5 bg-border mx-1"></div>
+                    <div id="selection-color-wrapper" class="relative p-1 cursor-pointer rounded-md transition-all duration-200 flex items-center justify-center hover:bg-white/10" title="Change Color">
+                        <div id="selection-color-display" class="w-6 h-6 rounded-full bg-secondary border-2 border-panel shadow-[0_0_0_1px_var(--border)]"></div>
+                    </div>
+                </div>
+                
+                <div id="selection-color-picker" class="hidden absolute bottom-[80px] left-1/2 -translate-x-1/2 w-[280px] grid-cols-7 z-[101] p-2.5 bg-panel border border-border rounded-xl shadow-[0_8px_24px_rgba(0,0,0,0.5)] gap-2"></div>
+            </div>
+
+            <div id="revisions-view" class="view hidden w-full h-full relative"></div>
+        </main>
+    </div>
+
+    <div id="custom-modal" class="fixed inset-0 w-full h-full bg-black/60 backdrop-blur-md flex items-center justify-center z-[1000] opacity-0 pointer-events-none transition-opacity duration-300">
+        <div class="bg-panel border border-border rounded-xl p-6 w-[90%] max-w-[400px] shadow-[0_10px_30px_rgba(0,0,0,0.5)] scale-95 transition-transform duration-300 modal-content">
+            <h3 id="modal-title" class="text-xl font-semibold m-0 mb-4">Modal Title</h3>
+            <div id="modal-body" class="mb-6 mb-0 text-secondary leading-relaxed"></div>
+            <div id="modal-actions" class="flex justify-end gap-3"></div>
+        </div>
+    </div>
+
+    <!-- Script logic -->
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
